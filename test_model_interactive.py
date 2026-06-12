@@ -1,13 +1,19 @@
 """
-Test any model on a single image or folder of images.
-No labels or masks needed.
+Test any model on a single image or folder.
+
+For SAM2/MedSAM: you will be asked to draw a bounding box
+around the burn region (click and drag). This is the location
+prompt the model needs — same as training.
+
+For UNet++/SegFormer: no prompt needed, fully automatic.
 
 RUN:
   python test_single_image.py --input path/to/image.jpg --model sam2
-  python test_single_image.py --input path/to/folder   --model sam2
-  python test_single_image.py --input path/to/folder   --model medsam
   python test_single_image.py --input path/to/folder   --model unetpp
   python test_single_image.py --input path/to/folder   --model segformer
+  python test_single_image.py --input path/to/folder   --model medsam
+
+For SAM2/MedSAM on a folder, you will draw a box for each image.
 """
 import os, sys, argparse
 BASE     = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +29,62 @@ from PIL import Image
 
 DEVICE   = 'cuda' if torch.cuda.is_available() else 'cpu'
 IMG_SIZE = 1024
-FULL_BOX = np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+
+# ── Interactive bbox drawing ───────────────────────────────────────
+drawing  = False
+ix, iy   = -1, -1
+rect     = [0, 0, 0, 0]
+img_disp = None
+
+def mouse_callback(event, x, y, flags, param):
+    global drawing, ix, iy, rect, img_disp
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drawing = True
+        ix, iy  = x, y
+        rect    = [x, y, x, y]
+    elif event == cv2.EVENT_MOUSEMOVE and drawing:
+        rect[2], rect[3] = x, y
+        tmp = img_disp.copy()
+        cv2.rectangle(tmp, (rect[0], rect[1]), (rect[2], rect[3]), (0,255,0), 2)
+        cv2.imshow('Draw box around burn — press ENTER when done', tmp)
+    elif event == cv2.EVENT_LBUTTONUP:
+        drawing = False
+        rect[2], rect[3] = x, y
+        tmp = img_disp.copy()
+        cv2.rectangle(tmp, (rect[0], rect[1]), (rect[2], rect[3]), (0,255,0), 2)
+        cv2.imshow('Draw box around burn — press ENTER when done', tmp)
+
+
+def get_user_bbox(img_np, img_size):
+    """Opens a window for user to draw bbox. Returns box in img_size coords."""
+    global img_disp, rect
+    h, w     = img_np.shape[:2]
+    img_bgr  = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    # resize for display if too large
+    scale    = min(800/w, 700/h, 1.0)
+    disp_w, disp_h = int(w*scale), int(h*scale)
+    img_disp = cv2.resize(img_bgr, (disp_w, disp_h))
+    rect     = [0, 0, disp_w, disp_h]
+
+    win = 'Draw box around burn — press ENTER when done'
+    cv2.namedWindow(win)
+    cv2.setMouseCallback(win, mouse_callback)
+    print("  -> Draw a box around the burn area, then press ENTER")
+    cv2.imshow(win, img_disp)
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        if key == 13 or key == ord('q'):  # ENTER or q
+            break
+    cv2.destroyAllWindows()
+
+    # scale box back to original image coords, then to img_size
+    x1 = min(rect[0], rect[2]) / scale * img_size / w
+    y1 = min(rect[1], rect[3]) / scale * img_size / h
+    x2 = max(rect[0], rect[2]) / scale * img_size / w
+    y2 = max(rect[1], rect[3]) / scale * img_size / h
+    print(f"  -> Box: [{int(x1)},{int(y1)},{int(x2)},{int(y2)}]")
+    return np.array([[x1, y1, x2, y2]], dtype=np.float32)
 
 
 # ── SAM2 ──────────────────────────────────────────────────────────
@@ -40,10 +100,10 @@ def load_sam2():
     return model, SAM2ImagePredictor(model)
 
 
-def predict_sam2(model, predictor, img_np):
+def predict_sam2(model, predictor, img_np, box):
     h, w  = img_np.shape[:2]
     img_r = cv2.resize(img_np, (IMG_SIZE, IMG_SIZE))
-    box_t = torch.from_numpy(FULL_BOX).to(DEVICE)
+    box_t = torch.from_numpy(box).to(DEVICE)
     with torch.no_grad():
         predictor.set_image(img_r)
         feats    = predictor._features
@@ -63,7 +123,7 @@ def predict_sam2(model, predictor, img_np):
         return (torch.sigmoid(logits[0,0]) > 0.5).cpu().numpy().astype(np.uint8) * 255
 
 
-# ── SAM ViT-B (medsam) ────────────────────────────────────────────
+# ── MedSAM ────────────────────────────────────────────────────────
 def load_medsam():
     from segment_anything import sam_model_registry
     model = sam_model_registry['vit_b'](
@@ -74,11 +134,11 @@ def load_medsam():
     return model, None
 
 
-def predict_medsam(model, predictor, img_np):
+def predict_medsam(model, aux, img_np, box):
     h, w  = img_np.shape[:2]
     img_r = cv2.resize(img_np, (IMG_SIZE, IMG_SIZE))
     img_t = torch.from_numpy(img_r).permute(2,0,1).float().unsqueeze(0).to(DEVICE) / 255.
-    box_t = torch.from_numpy(FULL_BOX).to(DEVICE)
+    box_t = torch.from_numpy(box).to(DEVICE)
     with torch.no_grad():
         img_emb       = model.image_encoder(img_t)
         sparse, dense = model.prompt_encoder(
@@ -113,7 +173,7 @@ def load_unetpp():
     return model, transform
 
 
-def predict_unetpp(model, transform, img_np):
+def predict_unetpp(model, transform, img_np, box=None):
     h, w = img_np.shape[:2]
     inp  = transform(image=img_np)['image'].unsqueeze(0).to(DEVICE)
     with torch.no_grad():
@@ -131,7 +191,7 @@ def load_segformer():
     return model, SegformerImageProcessor()
 
 
-def predict_segformer(model, processor, img_np):
+def predict_segformer(model, processor, img_np, box=None):
     h, w   = img_np.shape[:2]
     inputs = processor(images=Image.fromarray(img_np), return_tensors='pt')
     pv     = inputs['pixel_values'].to(DEVICE)
@@ -142,12 +202,12 @@ def predict_segformer(model, processor, img_np):
         return logits.argmax(dim=1).squeeze().cpu().numpy().astype(np.uint8) * 255
 
 
-# ── Shared ────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────
 MODELS = {
-    'sam2':      (load_sam2,     predict_sam2),
-    'medsam':    (load_medsam,   predict_medsam),
-    'unetpp':    (load_unetpp,   predict_unetpp),
-    'segformer': (load_segformer, predict_segformer),
+    'sam2':      (load_sam2,      predict_sam2,      True),   # needs_box
+    'medsam':    (load_medsam,    predict_medsam,    True),
+    'unetpp':    (load_unetpp,    predict_unetpp,    False),
+    'segformer': (load_segformer, predict_segformer, False),
 }
 
 
@@ -162,16 +222,23 @@ def make_overlay(img_np, pred):
     return overlay
 
 
-def process_image(img_path, model_name, model, aux, out_dir):
+def process_image(img_path, model_name, model, aux, needs_box, out_dir):
     img_np = np.array(Image.open(img_path).convert('RGB'))
     stem   = os.path.splitext(os.path.basename(img_path))[0]
-    _, predict_fn = MODELS[model_name]
-    pred = predict_fn(model, aux, img_np)
+    _, predict_fn, _ = MODELS[model_name]
+
+    box = None
+    if needs_box:
+        print(f"\n{os.path.basename(img_path)}")
+        box = get_user_bbox(img_np, IMG_SIZE)
+
+    pred = predict_fn(model, aux, img_np, box)
     cv2.imwrite(os.path.join(out_dir, f'{stem}_mask.png'), pred)
     cv2.imwrite(os.path.join(out_dir, f'{stem}_overlay.png'),
                 make_overlay(img_np, pred))
+
     burn_pct = 100 * (pred > 128).sum() / pred.size
-    print(f"  {os.path.basename(img_path):55s}  burn: {burn_pct:.2f}%")
+    print(f"  Burn area: {burn_pct:.2f}%  ->  saved to {out_dir}")
 
 
 def main():
@@ -179,8 +246,7 @@ def main():
     parser.add_argument('--input',  required=True,
                         help='Path to image or folder')
     parser.add_argument('--model',  default='sam2',
-                        choices=['sam2', 'medsam', 'unetpp', 'segformer'],
-                        help='Model to use (default: sam2)')
+                        choices=['sam2', 'medsam', 'unetpp', 'segformer'])
     parser.add_argument('--output', default=None,
                         help='Output folder (default: outputs/single_test)')
     args = parser.parse_args()
@@ -199,36 +265,25 @@ def main():
         print(f"ERROR: {args.input} not found"); return
 
     if not images:
-        print(f"No images found in {args.input}"); return
+        print(f"No images found"); return
+
+    _, _, needs_box = MODELS[args.model]
 
     print(f"Device  : {DEVICE}")
     print(f"Model   : {args.model}")
     print(f"Images  : {len(images)}")
+    if needs_box:
+        print(f"NOTE: You will draw a bounding box for each image")
     print(f"Output  : {out_dir}\n")
 
-    load_fn, _ = MODELS[args.model]
-    model, aux  = load_fn()
+    load_fn, _, _ = MODELS[args.model]
+    model, aux    = load_fn()
 
     for img_path in images:
-        process_image(img_path, args.model, model, aux, out_dir)
+        process_image(img_path, args.model, model, aux, needs_box, out_dir)
 
     print(f"\nDone! Results in: {out_dir}")
-    print(f"  *_mask.png    = binary burn mask")
-    print(f"  *_overlay.png = burn area (red) on original image")
 
 
 if __name__ == '__main__':
     main()
-
-
-
-
-    
-# Single image:
-#     python test_model.py --input "C:\path\to\image.jpg" --model sam2
-# Entire folder:
-#     python test_model.py --input "C:\path\to\folder" --model sam2
-# Custom output folder:
-#     python test_model.py --input "C:\path\to\folder" --model sam2 --output "C:\path\to\results"
-
-# ex: python test_model.py --input "D:\NahidW\Coding\sample_images" --model sam2 --output "D:\NahidW\Coding\5.face_burn_segmentation\outputs\single_test\sam2"
