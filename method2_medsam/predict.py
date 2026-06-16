@@ -1,6 +1,6 @@
 """
-SAM-Med2D / SAM ViT-B Predict
-Uses GT bbox prompt — CONSISTENT with training.
+MedSAM Predict — HONEST version.
+Full image prompt — no GT bbox. Consistent with training.
 RUN: python method2_medsam/predict.py
 """
 import os, sys
@@ -15,32 +15,13 @@ from utils.metrics import compute_metrics, print_metrics
 
 BASE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEVICE   = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-CKPT_IN  = os.path.join(BASE, 'checkpoints', 'medsam', 'sam_med2d.pth')
-if not os.path.exists(CKPT_IN):
-    CKPT_IN = os.path.join(BASE, 'checkpoints', 'medsam', 'sam_vit_b.pth')
-if not os.path.exists(CKPT_IN):
-    CKPT_IN = os.path.join(BASE, 'checkpoints', 'medsam', 'medsam_vit_b.pth')
-
+CKPT_IN  = os.path.join(BASE, 'checkpoints', 'medsam', 'medsam_vit_b.pth')
 CKPT_FT  = os.path.join(BASE, 'checkpoints', 'medsam', 'best.pth')
 TEST_IMG = os.path.join(BASE, 'dataset', 'test', 'images')
 TEST_MSK = os.path.join(BASE, 'dataset', 'test', 'masks')
 OUT_DIR  = os.path.join(BASE, 'outputs', 'medsam')
 IMG_SIZE = 1024
-
-
-def get_bbox(mask_np):
-    """GT bbox — same prompt used during training."""
-    h, w   = mask_np.shape[:2]
-    ys, xs = np.where(mask_np > 0)
-    if len(ys) == 0:
-        return np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
-    return np.array([[
-        xs.min() * IMG_SIZE / w,
-        ys.min() * IMG_SIZE / h,
-        xs.max() * IMG_SIZE / w,
-        ys.max() * IMG_SIZE / h,
-    ]], dtype=np.float32)
+FULL_BOX = np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
 
 
 def load_model():
@@ -51,11 +32,11 @@ def load_model():
     return model
 
 
-def predict_one(model, img_np, gt_np):
+def predict_one(model, img_np):
     h, w  = img_np.shape[:2]
     img_r = cv2.resize(img_np, (IMG_SIZE, IMG_SIZE))
     img_t = torch.from_numpy(img_r).permute(2,0,1).float().unsqueeze(0).to(DEVICE) / 255.
-    box_t = torch.from_numpy(get_bbox(gt_np)).to(DEVICE)
+    box_t = torch.from_numpy(FULL_BOX).to(DEVICE)
     with torch.no_grad():
         img_emb       = model.image_encoder(img_t)
         sparse, dense = model.prompt_encoder(
@@ -76,11 +57,11 @@ def overlay(img_bgr, pred, gt, alpha=0.4):
     color = np.zeros_like(img_bgr)
     color[pred > 128] = (0, 0, 255)
     vis = cv2.addWeighted(img_bgr, 1-alpha, color, alpha, 0)
-    for cnts_data, color_val in [
+    for c, col in [
         (cv2.findContours((pred>128).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0], (0,255,255)),
         (cv2.findContours((gt>128).astype(np.uint8),   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0], (0,255,0)),
     ]:
-        cv2.drawContours(vis, cnts_data, -1, color_val, 2)
+        cv2.drawContours(vis, c, -1, col, 2)
     return vis
 
 
@@ -89,7 +70,7 @@ def main():
     model   = load_model()
     results = []
 
-    print("Running SAM ViT-B predictions on test set...")
+    print("Running MedSAM predictions (full image, no GT hints)...")
     for fname in sorted(os.listdir(TEST_IMG)):
         if not fname.endswith(('.jpg','.png')): continue
         stem     = os.path.splitext(fname)[0]
@@ -99,7 +80,7 @@ def main():
                    if os.path.exists(msk_path) \
                    else np.zeros(img_np.shape[:2], dtype=np.uint8)
 
-        pred = predict_one(model, img_np, gt_np)
+        pred = predict_one(model, img_np)
         cv2.imwrite(os.path.join(OUT_DIR, stem+'_mask.png'), pred)
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         gt_r    = cv2.resize(gt_np, (img_np.shape[1], img_np.shape[0]))
@@ -113,9 +94,8 @@ def main():
                   f"Prec:{m['precision']:.4f} Rec:{m['recall']:.4f}")
 
     if results:
-        print_metrics(results, 'SAM ViT-B (fine-tuned)')
+        print_metrics(results, 'MedSAM (honest - no GT hints)')
     print(f"\nOutputs: {OUT_DIR}")
-    print("  red=prediction  green=GT boundary")
 
 
 if __name__ == '__main__':

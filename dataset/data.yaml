@@ -2,12 +2,12 @@ train: ../train/images
 val: ../valid/images
 test: ../test/images
 
-nc: 1
-names: ['burn']
+nc: 2
+names: ['0', 'burn']
 
 roboflow:
   workspace: md-nahid-hasan
   project: facescartracking
-  version: 7
+  version: 9
   license: CC BY 4.0
-  url: https://universe.roboflow.com/md-nahid-hasan/facescartracking/dataset/7
+  url: https://universe.roboflow.com/md-nahid-hasan/facescartracking/dataset/9

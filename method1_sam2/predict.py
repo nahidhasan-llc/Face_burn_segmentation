@@ -1,5 +1,6 @@
 """
-SAM 2 Predict — consistent with training (GT bbox prompt).
+SAM2 Predict — HONEST version.
+Full image prompt — no GT bbox. Consistent with training.
 RUN: python method1_sam2/predict.py
 """
 import os, sys
@@ -23,20 +24,7 @@ TEST_IMG = os.path.join(BASE, 'dataset', 'test', 'images')
 TEST_MSK = os.path.join(BASE, 'dataset', 'test', 'masks')
 OUT_DIR  = os.path.join(BASE, 'outputs', 'sam2')
 IMG_SIZE = 1024
-
-
-def get_bbox(mask_np):
-    """GT bbox — same prompt used in training."""
-    h, w   = mask_np.shape[:2]
-    ys, xs = np.where(mask_np > 0)
-    if len(ys) == 0:
-        return np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
-    return np.array([[
-        xs.min() * IMG_SIZE / w,
-        ys.min() * IMG_SIZE / h,
-        xs.max() * IMG_SIZE / w,
-        ys.max() * IMG_SIZE / h,
-    ]], dtype=np.float32)
+FULL_BOX = np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
 
 
 def load_model():
@@ -48,27 +36,23 @@ def load_model():
     return model, SAM2ImagePredictor(model)
 
 
-def predict_one(model, predictor, img_np, gt_np):
+def predict_one(model, predictor, img_np):
     h, w  = img_np.shape[:2]
     img_r = cv2.resize(img_np, (IMG_SIZE, IMG_SIZE))
-    box   = get_bbox(gt_np)
-
+    box_t = torch.from_numpy(FULL_BOX).to(DEVICE)
     with torch.no_grad():
         predictor.set_image(img_r)
         feats    = predictor._features
-        img_emb  = feats['image_embed']
-        high_res = feats['high_res_feats']
-        box_t    = torch.from_numpy(box).to(DEVICE)
         sparse, dense = model.sam_prompt_encoder(
             points=None, boxes=box_t, masks=None)
         out = model.sam_mask_decoder(
-            image_embeddings=img_emb,
+            image_embeddings=feats['image_embed'],
             image_pe=model.sam_prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse,
             dense_prompt_embeddings=dense,
             multimask_output=False,
             repeat_image=False,
-            high_res_features=high_res,
+            high_res_features=feats['high_res_feats'],
         )
         logits = out[0] if isinstance(out, (tuple, list)) else out
         logits = F.interpolate(logits, size=(h,w),
@@ -80,11 +64,11 @@ def overlay(img_bgr, pred, gt, alpha=0.4):
     color = np.zeros_like(img_bgr)
     color[pred > 128] = (0, 0, 255)
     vis = cv2.addWeighted(img_bgr, 1-alpha, color, alpha, 0)
-    for cnts_data, col in [
+    for c, col in [
         (cv2.findContours((pred>128).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0], (0,255,255)),
         (cv2.findContours((gt>128).astype(np.uint8),   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0], (0,255,0)),
     ]:
-        cv2.drawContours(vis, cnts_data, -1, col, 2)
+        cv2.drawContours(vis, c, -1, col, 2)
     return vis
 
 
@@ -93,7 +77,7 @@ def main():
     model, predictor = load_model()
     results = []
 
-    print("Running SAM 2 predictions on test set...")
+    print("Running SAM2 predictions (full image, no GT hints)...")
     for fname in sorted(os.listdir(TEST_IMG)):
         if not fname.endswith(('.jpg','.png')): continue
         stem     = os.path.splitext(fname)[0]
@@ -103,7 +87,7 @@ def main():
                    if os.path.exists(msk_path) \
                    else np.zeros(img_np.shape[:2], dtype=np.uint8)
 
-        pred = predict_one(model, predictor, img_np, gt_np)
+        pred = predict_one(model, predictor, img_np)
         cv2.imwrite(os.path.join(OUT_DIR, stem+'_mask.png'), pred)
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
         gt_r    = cv2.resize(gt_np, (img_np.shape[1], img_np.shape[0]))
@@ -117,9 +101,8 @@ def main():
                   f"Prec:{m['precision']:.4f} Rec:{m['recall']:.4f}")
 
     if results:
-        print_metrics(results, 'SAM 2 Hiera-Large (fine-tuned)')
+        print_metrics(results, 'SAM2 (honest - no GT hints)')
     print(f"\nOutputs: {OUT_DIR}")
-    print("  red=prediction  green=GT boundary")
 
 
 if __name__ == '__main__':

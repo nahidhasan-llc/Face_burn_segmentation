@@ -355,3 +355,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+    # ex: python test_model_interactive.py --input "D:\NahidW\Coding\sample_images" --model sam2 --output "D:\NahidW\Coding\5.face_burn_segmentation\outputs\single_test\sam2"

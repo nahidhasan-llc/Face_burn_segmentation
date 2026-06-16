@@ -1,9 +1,7 @@
 """
-SAM 2 Hiera-Large Fine-Tuning
-Correct approach: train WITH GT bbox prompt, predict WITH GT bbox prompt.
-The bbox tells the model WHERE the burn is.
-The model learns to segment the exact boundary WITHIN that region.
-
+SAM2 Fine-Tuning — HONEST version.
+No bbox prompt. Model sees full image and must find burn itself.
+Train and predict both use identical full-image prompt.
 RUN: python method1_sam2/train.py
 """
 import os, sys
@@ -35,6 +33,8 @@ TEST_MSK  = os.path.join(BASE, 'dataset', 'test',  'masks')
 IMG_SIZE  = 1024
 EPOCHS    = 50
 LR        = 1e-4
+# Full image — model must find burn on its own
+FULL_BOX  = np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
 
 
 class BurnDataset(Dataset):
@@ -62,32 +62,16 @@ class BurnDataset(Dataset):
         img  = cv2.resize(img,  (IMG_SIZE, IMG_SIZE))
         mask = cv2.resize(mask, (IMG_SIZE, IMG_SIZE),
                           interpolation=cv2.INTER_NEAREST)
-
-        # GT bbox with small jitter for robustness
-        ys, xs = np.where(mask > 0)
-        if len(ys) > 0:
-            pad_x = int((xs.max()-xs.min()) * 0.05) + 2
-            pad_y = int((ys.max()-ys.min()) * 0.05) + 2
-            box = np.array([
-                max(0, xs.min()-pad_x),
-                max(0, ys.min()-pad_y),
-                min(IMG_SIZE, xs.max()+pad_x),
-                min(IMG_SIZE, ys.max()+pad_y),
-            ], dtype=np.float32)
-        else:
-            box = np.array([0, 0, IMG_SIZE, IMG_SIZE], dtype=np.float32)
-
         mask_t = torch.from_numpy(mask).unsqueeze(0).float()
-        return img, mask_t, box   # img = numpy uint8 HxWxC
+        return img, mask_t
 
 
-def run_decoder(model, predictor, img_np, box_np):
-    """Run SAM2 forward pass with bbox prompt."""
+def forward_pass(model, predictor, img_np, box_np):
     predictor.set_image(img_np)
     feats    = predictor._features
-    img_emb  = feats['image_embed'].clone()
-    high_res = [f.clone() for f in feats['high_res_feats']]
-    box_t    = torch.from_numpy(box_np.reshape(1,4)).to(DEVICE)
+    img_emb  = feats['image_embed']
+    high_res = feats['high_res_feats']
+    box_t    = torch.from_numpy(box_np).to(DEVICE)
     sparse, dense = model.sam_prompt_encoder(
         points=None, boxes=box_t, masks=None)
     out = model.sam_mask_decoder(
@@ -106,31 +90,24 @@ def run_decoder(model, predictor, img_np, box_np):
 
 def train():
     torch.cuda.empty_cache()
-
     if not os.path.exists(SAM2_DIR):
-        print(f"ERROR: SAM2 not found at {SAM2_DIR}")
-        print("  git clone https://github.com/facebookresearch/segment-anything-2.git")
-        return
+        print(f"ERROR: {SAM2_DIR} not found"); return
     if not os.path.exists(CKPT_IN):
-        print(f"ERROR: checkpoint not found at {CKPT_IN}")
-        return
-
+        print(f"ERROR: {CKPT_IN} not found"); return
     try:
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
     except ImportError:
-        print("Run: cd segment-anything-2 && python -m pip install -e .")
-        return
+        print("Run: cd segment-anything-2 && python -m pip install -e ."); return
 
     print(f"Device : {DEVICE}")
-    print("Loading SAM 2 Hiera-Large ...")
+    print("Training with FULL IMAGE prompt — no location hints")
     model     = build_sam2(SAM2_CFG, CKPT_IN, device=DEVICE)
     predictor = SAM2ImagePredictor(model)
 
     for name, p in model.named_parameters():
         p.requires_grad = 'mask_decoder' in name
-    n = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable: {n:,} (mask decoder only)")
+    print(f"Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     collate  = lambda x: x
     train_ds = BurnDataset(TRAIN_IMG, TRAIN_MSK)
@@ -151,7 +128,7 @@ def train():
         total_loss = 0.0
 
         for batch in train_dl:
-            img, mask_gt, box = batch[0]
+            img, mask_gt = batch[0]
             mask_gt = mask_gt.unsqueeze(0).to(DEVICE)
 
             with torch.inference_mode(False):
@@ -161,7 +138,7 @@ def train():
                 img_emb  = feats['image_embed'].clone()
                 high_res = [f.clone() for f in feats['high_res_feats']]
 
-            box_t = torch.from_numpy(np.array(box).reshape(1,4)).to(DEVICE)
+            box_t = torch.from_numpy(FULL_BOX).to(DEVICE)
             sparse, dense = model.sam_prompt_encoder(
                 points=None, boxes=box_t, masks=None)
             out = model.sam_mask_decoder(
@@ -185,15 +162,13 @@ def train():
 
         scheduler.step()
 
-        # validation
         model.eval()
         dice_list = []
         with torch.no_grad():
             for batch in valid_dl:
-                img, mask_gt, box = batch[0]
+                img, mask_gt = batch[0]
                 mask_gt = mask_gt.unsqueeze(0).to(DEVICE)
-                logits  = run_decoder(model, predictor, img,
-                                      np.array(box))
+                logits  = forward_pass(model, predictor, img, FULL_BOX)
                 pred    = (torch.sigmoid(logits) > 0.5).float()
                 inter   = (pred * mask_gt).sum()
                 dice    = (2*inter / (pred.sum() + mask_gt.sum() + 1e-6)).item()
@@ -207,17 +182,15 @@ def train():
             print(f"  -> Best saved (Dice: {best_dice:.4f})")
 
     print(f"\nDone! Best Val Dice: {best_dice:.4f}")
-
-    # test evaluation
     print("\nEvaluating on test set...")
     model.load_state_dict(torch.load(CKPT_OUT, map_location=DEVICE))
     model.eval()
     test_scores = []
     with torch.no_grad():
         for batch in test_dl:
-            img, mask_gt, box = batch[0]
+            img, mask_gt = batch[0]
             mask_gt = mask_gt.unsqueeze(0).to(DEVICE)
-            logits  = run_decoder(model, predictor, img, np.array(box))
+            logits  = forward_pass(model, predictor, img, FULL_BOX)
             pred    = (torch.sigmoid(logits) > 0.5).float()
             inter   = (pred * mask_gt).sum()
             dice    = (2*inter / (pred.sum() + mask_gt.sum() + 1e-6)).item()
