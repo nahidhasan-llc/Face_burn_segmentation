@@ -21,6 +21,7 @@ TEST_IMG = os.path.join(BASE, 'dataset', 'test', 'images')
 TEST_MSK = os.path.join(BASE, 'dataset', 'test', 'masks')
 OUT_DIR  = os.path.join(BASE, 'outputs', 'unetpp')
 IMG_SIZE = 512
+THRESHOLD = 0.6
 
 transform = A.Compose([
     A.Resize(IMG_SIZE, IMG_SIZE),
@@ -44,7 +45,7 @@ def predict_one(model, img_np):
     with torch.no_grad():
         prob = torch.sigmoid(model(inp)[0,0]).cpu().numpy()
     prob = cv2.resize(prob, (w, h))
-    return (prob > 0.5).astype(np.uint8) * 255
+    return (prob > THRESHOLD).astype(np.uint8) * 255
 
 
 def overlay(img_bgr, pred, gt, alpha=0.4):

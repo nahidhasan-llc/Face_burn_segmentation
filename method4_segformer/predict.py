@@ -19,7 +19,7 @@ CKPT_OUT = os.path.join(BASE, 'checkpoints', 'segformer')
 TEST_IMG = os.path.join(BASE, 'dataset', 'test', 'images')
 TEST_MSK = os.path.join(BASE, 'dataset', 'test', 'masks')
 OUT_DIR  = os.path.join(BASE, 'outputs', 'segformer')
-
+THRESHOLD = 0.7 # Adjusted threshold for SegFormer-B5 based on validation performance
 
 def load_model():
     model = SegformerForSemanticSegmentation.from_pretrained(CKPT_OUT).to(DEVICE)

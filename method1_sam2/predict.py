@@ -25,7 +25,7 @@ TEST_MSK = os.path.join(BASE, 'dataset', 'test', 'masks')
 OUT_DIR  = os.path.join(BASE, 'outputs', 'sam2')
 IMG_SIZE = 1024
 FULL_BOX = np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
-
+THRESHOLD = 0.65
 
 def load_model():
     from sam2.build_sam import build_sam2
@@ -57,7 +57,7 @@ def predict_one(model, predictor, img_np):
         logits = out[0] if isinstance(out, (tuple, list)) else out
         logits = F.interpolate(logits, size=(h,w),
                                mode='bilinear', align_corners=False)
-        return (torch.sigmoid(logits[0,0]) > 0.5).cpu().numpy().astype(np.uint8) * 255
+        return (torch.sigmoid(logits[0,0]) > THRESHOLD).cpu().numpy().astype(np.uint8) * 255
 
 
 def overlay(img_bgr, pred, gt, alpha=0.4):

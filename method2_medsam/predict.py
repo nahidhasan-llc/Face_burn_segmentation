@@ -22,6 +22,7 @@ TEST_MSK = os.path.join(BASE, 'dataset', 'test', 'masks')
 OUT_DIR  = os.path.join(BASE, 'outputs', 'medsam')
 IMG_SIZE = 1024
 FULL_BOX = np.array([[0, 0, IMG_SIZE, IMG_SIZE]], dtype=np.float32)
+THRESHOLD = 0.55
 
 
 def load_model():
@@ -50,7 +51,7 @@ def predict_one(model, img_np):
         )
         logits = F.interpolate(logits, size=(h,w),
                                mode='bilinear', align_corners=False)
-        return (torch.sigmoid(logits[0,0]) > 0.5).cpu().numpy().astype(np.uint8) * 255
+        return (torch.sigmoid(logits[0,0]) > THRESHOLD).cpu().numpy().astype(np.uint8) * 255
 
 
 def overlay(img_bgr, pred, gt, alpha=0.4):
